@@ -1,0 +1,270 @@
+#!/bin/bash
+# Bootstrap for the Airflow box.
+#
+# Brings up Airflow ${airflow_version} under docker compose with a LocalExecutor and a
+# Postgres container, then keeps /opt/ice/dags in step with the artifacts bucket on a
+# one-minute timer — which is what lets the deploy workflow's `aws s3 sync` reach this
+# box without a second deployment mechanism.
+#
+# Runs once at first boot, but every step is create-if-absent: debugging a
+# half-finished bootstrap over SSM is worse than making it re-runnable.
+#
+# TEMPLATING: rendered by Terraform's templatefile(), so a dollar-brace expression is
+# a Terraform substitution and a doubled dollar escapes one back to a plain shell
+# variable. The compose file is base64-encoded rather than templated, to keep it out
+# of that collision entirely — docker compose claims the same syntax.
+set -euxo pipefail
+
+REGION='${region}'
+ARTIFACTS='${artifacts_bucket}'
+ADMIN_SECRET='${admin_secret_name}'
+ADMIN_USER='${admin_user}'
+# Which Secrets Manager tree Airflow resolves Connections and Variables from. This is
+# the whole of what makes the dev box read dev's configuration — see the note beside
+# AIRFLOW__SECRETS__BACKEND_KWARGS in the compose file.
+SECRETS_PREFIX='${secrets_prefix}'
+# Which image to run, and where to authenticate to get it. The secret holds a full
+# image reference including the tag; CI rewrites it on every deploy, and the timer
+# below is what turns that into a running container.
+IMAGE_SECRET='${image_secret_name}'
+ECR_REGISTRY='${ecr_registry}'
+
+# ------------------------------------------------------------------------ packages
+
+dnf update -y
+# jq parses the admin secret. The AWS CLI and the SSM agent ship with AL2023.
+dnf install -y docker jq
+
+systemctl enable --now docker
+systemctl enable --now amazon-ssm-agent
+
+# AL2023 packages no docker-compose plugin, so it is fetched directly. Pinned rather
+# than latest — a compose plugin that changes underneath a working box on its next
+# reboot is not a convenience.
+if [ ! -x /usr/local/lib/docker/cli-plugins/docker-compose ]; then
+  install -d -m 0755 /usr/local/lib/docker/cli-plugins
+  curl -fsSL '${compose_url}' -o /usr/local/lib/docker/cli-plugins/docker-compose
+  chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+fi
+
+# Swap, because 2 GiB is not enough headroom for the scheduler, the web server,
+# Postgres and a running task at once. Without it the box does not degrade, it stops
+# answering: the SSM agent loses its connection while EC2's own status checks still
+# report ok, so it reads as a network fault rather than a starved instance. Swap
+# turns that cliff into ordinary slowness.
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >>/etc/fstab
+  # Prefer reclaiming page cache over swapping; swap here is a safety net for peaks,
+  # not somewhere the scheduler should live.
+  sysctl -w vm.swappiness=10
+  echo 'vm.swappiness=10' >/etc/sysctl.d/99-ice-swap.conf
+fi
+
+install -d -m 0755 /opt/ice /opt/ice/dags
+
+# --------------------------------------------------------------------------- image
+#
+# Pulled from ECR by tag, never built here. The box used to build its own image at
+# first boot from a requirements.txt fetched out of S3, which made the running Python
+# environment unaddressable — nothing recorded what was in it, and the only way to
+# change it was to replace the instance. A DAG reached dev importing a package the
+# image did not have, because updating the S3 object did exactly nothing to a box
+# that had already built from it.
+#
+# So the image is an artifact with a name, built in CI against the same commit as the
+# DAGs, and this box's only job is to run whichever one the pointer secret names.
+
+echo '${compose_b64}' | base64 -d >/opt/ice/docker-compose.yml
+
+# --------------------------------------------------------------------- secrets/keys
+
+# Generated on the box and left on the root volume rather than passed in from
+# Terraform, so the key encrypting Airflow's own secrets never enters the state file.
+# Connections come from Secrets Manager regardless, so losing it on a rebuild costs
+# nothing.
+#
+# openssl rather than the obvious `docker run airflow python -c Fernet.generate_key()`:
+# that image's entrypoint prints a blank line to stdout before the key, which lands in
+# .env as a second line and makes docker compose refuse the whole file with
+# "unexpected character in variable name" — pointing at the key rather than at the
+# blank line above it. A Fernet key is just 32 random bytes in url-safe base64, so
+# there is no reason to start a container to produce one.
+if [ ! -f /opt/ice/fernet.key ]; then
+  openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n' >/opt/ice/fernet.key
+  chmod 600 /opt/ice/fernet.key
+fi
+
+# Postgres listens only on the compose network, but a default password would still
+# be a default password.
+if [ ! -f /opt/ice/postgres.key ]; then
+  openssl rand -hex 24 >/opt/ice/postgres.key
+  chmod 600 /opt/ice/postgres.key
+fi
+
+ADMIN_PASSWORD="$(aws secretsmanager get-secret-value \
+  --secret-id "$${ADMIN_SECRET}" --region "$${REGION}" \
+  --query SecretString --output text | jq -r .password)"
+
+# Written before the compose file is read, since compose substitutes from it.
+umask 077
+#
+# AIRFLOW_IMAGE is seeded empty and written by sync-image.sh below. compose refuses
+# to start with it unset, which is the correct failure: better than silently falling
+# back to a base image with none of the DAGs' dependencies in it.
+cat >/opt/ice/.env <<ENVFILE
+AIRFLOW_IMAGE=
+AIRFLOW_FERNET_KEY=$(cat /opt/ice/fernet.key)
+POSTGRES_PASSWORD=$(cat /opt/ice/postgres.key)
+AIRFLOW_ADMIN_USER=$${ADMIN_USER}
+AIRFLOW_ADMIN_PASSWORD=$${ADMIN_PASSWORD}
+SECRETS_PREFIX=$${SECRETS_PREFIX}
+AWS_DEFAULT_REGION=$${REGION}
+AWS_REGION=$${REGION}
+ENVFILE
+umask 022
+
+# ---------------------------------------------------------------------- image sync
+
+# Reads the pointer secret and, if it names something other than what is running,
+# pulls it and recreates the containers. Polled rather than pushed: the same shape as
+# the DAG sync, and for the same reason — no second channel into this box.
+#
+# The recorded tag is written only after a successful `up`, so a pull that fails
+# leaves the box on the image it already had and the next tick tries again. That
+# ordering is the difference between a bad deploy being a no-op and it being an
+# Airflow that is down until someone notices.
+cat >/opt/ice/sync-image.sh <<SYNC
+#!/bin/bash
+set -euo pipefail
+
+WANT=\$(aws secretsmanager get-secret-value --secret-id "$${IMAGE_SECRET}" \
+  --region "$${REGION}" --query SecretString --output text)
+HAVE=\$(cat /opt/ice/image.current 2>/dev/null || true)
+
+if [ "\$WANT" = "\$HAVE" ]; then
+  exit 0
+fi
+
+# Tokens last 12 hours and this runs every minute, so logging in each time it has
+# work to do is cheaper than tracking their expiry.
+aws ecr get-login-password --region "$${REGION}" \
+  | docker login --username AWS --password-stdin "$${ECR_REGISTRY}"
+
+docker pull "\$WANT"
+
+sed -i "s|^AIRFLOW_IMAGE=.*|AIRFLOW_IMAGE=\$WANT|" /opt/ice/.env
+cd /opt/ice && docker compose up -d --remove-orphans
+
+echo "\$WANT" >/opt/ice/image.current
+echo "airflow now running \$WANT"
+SYNC
+chmod +x /opt/ice/sync-image.sh
+
+cat >/etc/systemd/system/ice-image-sync.service <<'UNIT'
+[Unit]
+Description=Pull the Airflow image named by the pointer secret
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ice/sync-image.sh
+UNIT
+
+cat >/etc/systemd/system/ice-image-sync.timer <<'UNIT'
+[Unit]
+Description=Check for a new Airflow image every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+# ------------------------------------------------------------------------ dag sync
+
+# --delete so a DAG removed from the repo leaves this box too. There is no longer a
+# requirements.txt to exclude — it moved to docker/airflow, which is where the thing
+# that installs it lives.
+cat >/opt/ice/sync-dags.sh <<SYNC
+#!/bin/bash
+set -euo pipefail
+exec aws s3 sync "s3://$${ARTIFACTS}/dags/" /opt/ice/dags/ --region "$${REGION}" --delete --exclude '*__pycache__/*'
+SYNC
+chmod +x /opt/ice/sync-dags.sh
+
+cat >/etc/systemd/system/ice-dag-sync.service <<'UNIT'
+[Unit]
+Description=Sync DAGs from S3
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ice/sync-dags.sh
+UNIT
+
+cat >/etc/systemd/system/ice-dag-sync.timer <<'UNIT'
+[Unit]
+Description=Sync DAGs from S3 every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+# `up -d` without --build: the image is pulled by sync-image.sh, and a compose file
+# that could still build one would quietly paper over a registry that was
+# unreachable. TimeoutStartSec covers a cold pull of the base layers.
+cat >/etc/systemd/system/ice-airflow.service <<'UNIT'
+[Unit]
+Description=Airflow (docker compose)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/ice
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+
+# Seed the DAGs before Airflow starts, so the first scheduler parse already has them.
+/opt/ice/sync-dags.sh
+
+# The first image has to be pulled before compose has anything to run, and on a brand
+# new environment it does not exist yet: Terraform seeds the pointer with :latest, and
+# nothing pushes to that tag until the deploy workflow runs. So wait, rather than fail
+# the bootstrap on a race with CI. Twenty minutes is long enough for a deploy that is
+# already running and short enough to give up on one that is not — the timer keeps
+# trying either way, so this bound only decides whether the bootstrap logs a success.
+for attempt in $(seq 1 40); do
+  if /opt/ice/sync-image.sh; then
+    break
+  fi
+  echo "no image yet (attempt $attempt) — is the deploy workflow still running?"
+  sleep 30
+done
+
+systemctl enable --now ice-dag-sync.timer
+systemctl enable --now ice-image-sync.timer
+systemctl enable --now ice-airflow.service
+
+echo "airflow bootstrap complete"

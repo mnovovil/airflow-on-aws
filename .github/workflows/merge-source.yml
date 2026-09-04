@@ -1,0 +1,35 @@
+name: merge source
+
+# main is the prod branch, and the only thing that should reach it is what dev has
+# already deployed and survived. This fails any PR into main that comes from
+# somewhere else, so a feature branch cannot skip the dev environment on its way
+# to production.
+#
+# The check only reports a status — GitHub decides nothing on its own. To actually
+# block the merge, add "only dev may merge into main" as a required status check on
+# main's branch protection rule.
+on:
+  pull_request:
+    # `edited` matters: without it, retargeting an existing PR onto main after it
+    # passed would leave the stale success behind.
+    types: [opened, reopened, synchronize, edited]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  source-branch:
+    name: only dev may merge into main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the source branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "dev" ]; then
+            echo "::error::PRs into main must come from dev, not '$HEAD_REF'." \
+                 "Merge this into dev first, let it deploy, then open dev -> main."
+            exit 1
+          fi
+          echo "Source branch is dev."

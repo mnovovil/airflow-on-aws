@@ -1,0 +1,70 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+# envs/*.tfvars are committed on purpose and hold only placeholders. These two
+# forms are not: Terraform loads them automatically, without being named on the
+# command line, which makes them where a real value gets dropped and forgotten.
+terraform.tfvars
+*.auto.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+
+# Plan output. Both can contain the full resolved configuration of a live stack.
+tfplan
+plan.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Build artifacts
+dist/
+build/
+*.zip
+
+# A read-only mirror of the STAC catalogue, pulled down by scripts/stac_ui.sh.
+# S3 is the source of truth; this copy is disposable and re-synced on every run.
+local/stac/
+
+# Rasters — never commit test data
+*.tif
+*.TIF
+*.tiff
+*.TIFF
+*.img
+*.jp2
+# GDAL's statistics sidecar, written next to a raster during local runs
+*.aux.xml
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets — never commit. local/.env.example is the template to copy.
+.env
+.env.*
+!.env.example
+local/.env
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+credentials
+.aws/
+
+# Local Airflow home — this directory doubles as AIRFLOW_HOME when running locally
+airflow.db
+airflow.cfg
+webserver_config.py
+logs/

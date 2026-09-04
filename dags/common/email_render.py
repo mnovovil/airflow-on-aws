@@ -1,0 +1,611 @@
+"""Render the gdalinfo summary as an HTML email body.
+
+Kept free of Airflow imports so it can be exercised straight from a REPL while
+iterating on the layout. That extends to ``build_message`` at the bottom, which
+assembles a MIME tree with stdlib ``email`` and nothing else — the SMTP hook takes the
+message and sends it, but does not have to be present to build one.
+"""
+
+from __future__ import annotations
+
+import html
+import mimetypes
+import os
+from email.mime.application import MIMEApplication
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # annotations only — this module stays importable without pandas
+    import pandas as pd
+
+STYLE = """
+  body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         color: #1a1a1a; line-height: 1.45; }
+  h2 { margin: 0 0 4px; font-size: 18px; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 18px; }
+  table { border-collapse: collapse; margin-bottom: 22px; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 14px 6px 0; vertical-align: top; }
+  th { color: #555; font-weight: 600; white-space: nowrap; }
+  table.bands { border: 1px solid #e3e3e3; }
+  table.bands th, table.bands td { border-bottom: 1px solid #eee; padding: 6px 12px; }
+  table.bands thead th { background: #f6f6f6; }
+  code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+  .foot { color: #888; font-size: 12px; border-top: 1px solid #eee; padding-top: 10px; }
+"""
+
+
+def _fmt(value: Any, digits: int = 4) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        if value == int(value) and abs(value) < 1e15:
+            return f"{int(value):,}"
+        return f"{value:,.{digits}f}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return html.escape(str(value))
+
+
+def _rows(pairs: list[tuple[str, str]]) -> str:
+    return "\n".join(f"<tr><th>{html.escape(k)}</th><td>{v}</td></tr>" for k, v in pairs)
+
+
+def _bands_table(bands: list[dict]) -> str:
+    if not bands:
+        return "<p>No bands reported.</p>"
+
+    header = "".join(
+        f"<th>{h}</th>" for h in ("Band", "Type", "Interp.", "NoData", "Min", "Max", "Mean", "StdDev")
+    )
+    body = ""
+    for band in bands:
+        cells = [
+            _fmt(band.get("index")),
+            _fmt(band.get("type")),
+            _fmt(band.get("color_interpretation")),
+            _fmt(band.get("nodata")),
+            _fmt(band.get("min"), 2),
+            _fmt(band.get("max"), 2),
+            _fmt(band.get("mean"), 2),
+            _fmt(band.get("stddev"), 2),
+        ]
+        body += "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+
+    return (
+        f'<table class="bands"><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>'
+        '<p style="font-size:12px;color:#888;margin-top:-14px">'
+        "Statistics are approximate — computed from overviews rather than every pixel.</p>"
+    )
+
+
+def _extent(summary: dict) -> str:
+    corners = summary.get("corner_coordinates") or {}
+    upper_left = corners.get("upperLeft")
+    lower_right = corners.get("lowerRight")
+    if not (upper_left and lower_right):
+        return "—"
+    return (
+        f"<code>{_fmt(upper_left[0])}, {_fmt(upper_left[1])}</code> (upper left)<br>"
+        f"<code>{_fmt(lower_right[0])}, {_fmt(lower_right[1])}</code> (lower right)"
+    )
+
+
+def subject(summary: dict) -> str:
+    crs = summary.get("crs", {}) or {}
+    epsg = f" · EPSG:{crs['epsg']}" if crs.get("epsg") else ""
+    name = summary.get("file_name", "raster")
+    return f"[GDAL] {name} — {summary.get('width')}×{summary.get('height')}{epsg}"
+
+
+def render(summary: dict, report_location: str | None = None) -> str:
+    crs = summary.get("crs", {}) or {}
+    pixel = summary.get("pixel_size", {}) or {}
+
+    overview = _rows(
+        [
+            ("Source", f"<code>{html.escape(str(summary.get('source', '—')))}</code>"),
+            ("Size on disk", _fmt(summary.get("size_human"))),
+            ("Driver", _fmt(summary.get("driver"))),
+            ("Dimensions", f"{_fmt(summary.get('width'))} × {_fmt(summary.get('height'))} px"),
+            ("Bands", _fmt(summary.get("band_count"))),
+            (
+                "CRS",
+                f"{_fmt(crs.get('name'))}"
+                + (f" (EPSG:{crs['epsg']})" if crs.get("epsg") else "")
+                + (
+                    f"<br><span style='color:#888'>units: {html.escape(str(crs['units']))}</span>"
+                    if crs.get("units")
+                    else ""
+                ),
+            ),
+            ("Pixel size", f"{_fmt(pixel.get('x'))} × {_fmt(pixel.get('y'))}"),
+            ("Extent", _extent(summary)),
+            ("Inspected at", _fmt(summary.get("processed_at"))),
+        ]
+    )
+
+    footer = "Generated by the <code>gdalinfo_notify</code> Airflow DAG."
+    if report_location:
+        footer += f"<br>Full report: <code>{html.escape(report_location)}</code>"
+
+    return f"""<html><head><style>{STYLE}</style></head><body>
+  <h2>{html.escape(str(summary.get("file_name", "Raster")))}</h2>
+  <div class="sub">A new raster landed in S3 and GDAL had a look at it.</div>
+  <table>{overview}</table>
+  <h3 style="font-size:15px;margin-bottom:8px">Bands</h3>
+  {_bands_table(summary.get("bands") or [])}
+  <p class="foot">{footer}<br>The complete <code>gdalinfo -json</code> output is attached.</p>
+</body></html>"""
+
+
+# ------------------------------------------------------------------ weather forecast
+
+
+def _mm(value: Any) -> str:
+    return "—" if value is None else f"{value:,.1f} mm"
+
+
+def weather_subject(summary: dict) -> str:
+    forecast = summary.get("forecast", {}) or {}
+    valid_to = str(forecast.get("valid_to", ""))[:10] or "unknown"
+    hours = forecast.get("accumulation_hours", "?")
+    peak = _mm(forecast.get("max_mm"))
+    return f"[GFS] {hours}h US rainfall forecast to {valid_to} — peak {peak}"
+
+
+def render_weather(summary: dict, image_cid: str, report_location: str | None = None) -> str:
+    """The forecast email: the map first, then the numbers behind it.
+
+    ``image_cid`` is the Content-ID of the PNG part, without the angle brackets.
+    Referencing it as ``cid:`` rather than embedding a data: URI is not a style
+    preference — Gmail and Outlook both strip data: URIs out of image sources, so a
+    data-URI map arrives as a broken-image icon.
+    """
+    forecast = summary.get("forecast", {}) or {}
+    crs = summary.get("crs", {}) or {}
+    pixel = summary.get("pixel_size", {}) or {}
+
+    run = _rows(
+        [
+            ("Model", _fmt(forecast.get("model"))),
+            ("Cycle", f"<code>{html.escape(str(forecast.get('cycle', '—')))}</code>"),
+            (
+                "Valid",
+                f"<code>{html.escape(str(forecast.get('valid_from', '—')))}</code> → "
+                f"<code>{html.escape(str(forecast.get('valid_to', '—')))}</code>",
+            ),
+            ("Field", f"{_fmt(forecast.get('description'))} <code>{_fmt(forecast.get('element'))}</code>"),
+            ("Peak / mean", f"{_mm(forecast.get('max_mm'))} / {_mm(forecast.get('mean_mm'))}"),
+            ("Source", f"<code>{html.escape(str(summary.get('source', '—')))}</code>"),
+        ]
+    )
+
+    raster = _rows(
+        [
+            ("Driver", _fmt(summary.get("driver"))),
+            ("Dimensions", f"{_fmt(summary.get('width'))} × {_fmt(summary.get('height'))} px"),
+            (
+                "CRS",
+                f"{_fmt(crs.get('name'))}" + (f" (EPSG:{crs['epsg']})" if crs.get("epsg") else ""),
+            ),
+            ("Pixel size", f"{_fmt(pixel.get('x'))} × {_fmt(pixel.get('y'))}°"),
+            ("Extent", _extent(summary)),
+            ("GRIB download", _fmt(summary.get("size_human"))),
+            (
+                "GRIB band",
+                f"{_fmt(forecast.get('grib_band'))} of {_fmt(forecast.get('grib_band_count'))}"
+                " <span style='color:#888'>— chosen by accumulation window, not position</span>",
+            ),
+            ("Rendered at", _fmt(summary.get("processed_at"))),
+        ]
+    )
+
+    footer = "Generated by the <code>gdal_weather</code> Airflow DAG."
+    if report_location:
+        footer += f"<br>Products: <code>{html.escape(report_location)}</code>"
+
+    hours = _fmt(forecast.get("accumulation_hours"))
+    return f"""<html><head><style>{STYLE}</style></head><body>
+  <h2>{hours}-hour accumulated precipitation</h2>
+  <div class="sub">GFS forecast over the continental United States.</div>
+  <img src="cid:{html.escape(image_cid)}" width="723" alt="{hours}-hour rainfall forecast"
+       style="max-width:100%;height:auto;border:1px solid #e3e3e3;border-radius:4px">
+  <p style="font-size:12px;color:#888;margin-top:6px">
+    Transparent below 0.1 mm; the ramp runs 0.1 mm (pale blue) to 100 mm (magenta).</p>
+  <h3 style="font-size:15px;margin-bottom:8px">Forecast</h3>
+  <table>{run}</table>
+  <h3 style="font-size:15px;margin-bottom:8px">Raster</h3>
+  <table>{raster}</table>
+  <p class="foot">{footer}<br>The complete <code>gdalinfo -json</code> output is attached.</p>
+</body></html>"""
+
+
+# ---------------------------------------------------------------------------- stock
+
+OHLCV = ("Open", "High", "Low", "Close", "Volume")
+
+
+def _flatten_ohlcv(frame: pd.DataFrame) -> pd.DataFrame:
+    """Drop the ticker level ``yf.download`` adds to the columns.
+
+    Even for a single symbol yfinance returns a MultiIndex of (field, ticker), so
+    ``frame["Close"]`` is a one-column DataFrame rather than a Series and every lookup
+    below would need special-casing. Frames that already have flat columns pass
+    through untouched.
+    """
+    columns = frame.columns
+    if getattr(columns, "nlevels", 1) < 2:
+        return frame
+    names = list(columns.names)
+    # group_by="ticker" puts the symbol first; the default puts the field first.
+    level = names.index("Price") if "Price" in names else 0
+    flat = frame.copy()
+    flat.columns = columns.get_level_values(level)
+    return flat
+
+
+def _is_missing(value: Any) -> bool:
+    # NaN is the only value that is not equal to itself, which lets this module keep
+    # pandas out of its runtime imports and still recognise a gap in the data.
+    return value is None or value != value
+
+
+def _price(value: Any, currency: str = "", digits: int = 2) -> str:
+    """Format a number that came out of a DataFrame.
+
+    Two things ``_fmt`` gets wrong here. It drops the decimals on whole numbers, and a
+    close of 42 beside a close of 42.15 should not look like a different kind of
+    number; and its ``isinstance(value, int)`` test misses ``numpy.int64``, which does
+    not subclass ``int``, so volumes would arrive without their thousands separators.
+    """
+    if _is_missing(value):
+        return "—"
+    try:
+        text = f"{float(value):,.{digits}f}"
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+    # A non-breaking space so a table cell never wraps the amount away from its
+    # symbol. Written as an escape because the literal is invisible in source.
+    return f"{text}\u00a0{currency}" if currency else text
+
+
+def _session(frame: pd.DataFrame) -> dict[str, Any]:
+    """The last bar of the frame as a plain dict, plus the move across it."""
+    row = frame.iloc[-1]
+    values = {name: (row[name] if name in frame.columns else None) for name in OHLCV}
+    values["date"] = str(frame.index[-1])[:10]
+
+    opened, closed = values["Open"], values["Close"]
+    if _is_missing(opened) or _is_missing(closed) or not float(opened):
+        values["change"] = values["change_pct"] = None
+    else:
+        values["change"] = float(closed) - float(opened)
+        values["change_pct"] = values["change"] / float(opened) * 100
+    return values
+
+
+def _ohlcv_table(frame: pd.DataFrame, currency: str = "", max_rows: int = 30) -> str:
+    if frame.empty:
+        return "<p>No bars returned.</p>"
+
+    columns = [name for name in OHLCV if name in frame.columns]
+    header = "".join(f"<th>{name}</th>" for name in ["Date", *columns])
+
+    body = ""
+    for stamp, row in frame.tail(max_rows).iterrows():
+        cells = [html.escape(str(stamp)[:10])]
+        cells += [
+            _price(row[name], digits=0) if name == "Volume" else _price(row[name], currency)
+            for name in columns
+        ]
+        body += "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+
+    table = f'<table class="bands"><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>'
+    if len(frame) > max_rows:
+        table += (
+            '<p style="font-size:12px;color:#888;margin-top:-14px">'
+            f"Showing the {max_rows} most recent of {len(frame):,} bars.</p>"
+        )
+    return table
+
+
+def stock_subject(frame: pd.DataFrame, symbol: str, currency: str = "") -> str:
+    if frame.empty:
+        return f"[stock] {symbol} — no session data"
+    session = _session(_flatten_ohlcv(frame))
+    move = "" if session["change_pct"] is None else f" ({session['change_pct']:+.2f}%)"
+    return f"[stock] {symbol} {session['date']} — close {_price(session['Close'], currency)}{move}"
+
+
+def render_stock(
+    frame: pd.DataFrame,
+    symbol: str,
+    *,
+    currency: str = "",
+    name: str | None = None,
+    chart_cid: str | None = None,
+    report_location: str | None = None,
+) -> str:
+    """The stock email: the close first, then the bar it came from.
+
+    ``frame`` is whatever ``yf.download`` returned — the MultiIndex columns it uses
+    even for a single ticker are flattened here rather than at the call site, so the
+    DAG can hand the frame over untouched. An empty frame is an ordinary outcome
+    rather than an error (a holiday, or a run that happened before the close), and
+    renders as a short note saying so.
+
+    ``chart_cid`` is the Content-ID of an intraday PNG part, without the angle
+    brackets — the same arrangement ``render_weather`` uses, and for the same reason:
+    Gmail and Outlook strip data: URIs out of image sources. It is optional because
+    the chart is, and a session with no intraday bars still has an email.
+    """
+    frame = _flatten_ohlcv(frame)
+    title = html.escape(name or symbol)
+    footer = "Generated by the <code>stock</code> Airflow DAG."
+    if report_location:
+        footer += f"<br>Data: <code>{html.escape(report_location)}</code>"
+
+    if frame.empty:
+        return f"""<html><head><style>{STYLE}</style></head><body>
+  <h2>{title}</h2>
+  <div class="sub">No price data for the requested window.</div>
+  <p>Yahoo Finance returned an empty frame for <code>{html.escape(symbol)}</code>.
+     That is expected on a weekend or an exchange holiday, and on any run that lands
+     before the session has printed.</p>
+  <p class="foot">{footer}</p>
+</body></html>"""
+
+    chart = ""
+    if chart_cid:
+        chart = (
+            f'<img src="cid:{html.escape(chart_cid)}" width="723" alt="Hourly closes"\n'
+            '       style="max-width:100%;height:auto;margin-bottom:18px">'
+        )
+
+    session = _session(frame)
+    change, pct = session["change"], session["change_pct"]
+    if change is None:
+        badge = ""
+    else:
+        colour = "#157f3d" if change >= 0 else "#c0392b"
+        sign = "+" if change >= 0 else ""
+        badge = (
+            f'<span style="color:{colour};font-size:16px;margin-left:10px">'
+            f"{sign}{_price(change, currency)} ({pct:+.2f}%)</span>"
+        )
+
+    detail = _rows(
+        [
+            ("Symbol", f"<code>{html.escape(symbol)}</code>"),
+            ("Session", _fmt(session["date"])),
+            ("Open", _price(session["Open"], currency)),
+            (
+                "High / Low",
+                f"{_price(session['High'], currency)} / {_price(session['Low'], currency)}",
+            ),
+            ("Close", _price(session["Close"], currency)),
+            ("Volume", _price(session["Volume"], digits=0)),
+            ("Bars returned", _fmt(len(frame))),
+        ]
+    )
+
+    history = ""
+    if len(frame) > 1:
+        history = '<h3 style="font-size:15px;margin-bottom:8px">Bars</h3>' + _ohlcv_table(frame, currency)
+
+    return f"""<html><head><style>{STYLE}</style></head><body>
+  <h2>{title}</h2>
+  <div class="sub">Close for {html.escape(session["date"])}.</div>
+  <p style="margin:0 0 20px">
+    <span style="font-size:30px;font-weight:600">{_price(session["Close"], currency)}</span>
+    {badge}</p>
+  {chart}
+  <table>{detail}</table>
+  {history}
+  <p class="foot">{footer}</p>
+</body></html>"""
+
+
+# ---------------------------------------------------------------------- temperature
+
+
+def _degrees(value: Any, digits: int = 1) -> str:
+    """Format a temperature that came out of a Series.
+
+    ``_fmt`` is wrong here for the reason ``_price`` is: it drops the decimal on a
+    whole number, and 19°C beside 19.4°C should not look like a different kind of
+    reading. The degree sign is glued on with a non-breaking space so a narrow phone
+    never wraps the unit away from the number.
+    """
+    if _is_missing(value):
+        return "—"
+    try:
+        return f"{float(value):.{digits}f} °C"
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+
+
+def temperature_subject(series: pd.Series, name: str) -> str:
+    if series.empty:
+        return f"[temp] {name} — no observations"
+    day = str(series.index[0])[:10]
+    return f"[temp] {name} {day} — high {_degrees(series.max())}, low {_degrees(series.min())}"
+
+
+def render_temperature(
+    series: pd.Series,
+    name: str,
+    *,
+    station_id: str = "",
+    chart_cid: str | None = None,
+) -> str:
+    """The temperature email: the day's range first, then the chart it came from.
+
+    ``series`` is one day of hourly observations indexed by local wall time — the
+    shape ``get_temperature_data`` puts on XCom. An empty one is an ordinary outcome
+    rather than an error (a station that reported nothing, a run that landed before
+    the first observation) and renders as a short note saying so.
+
+    ``chart_cid`` is the Content-ID of the PNG part, without the angle brackets — the
+    same arrangement ``render_weather`` and ``render_stock`` use, and for the same
+    reason: Gmail and Outlook strip data: URIs out of image sources. It is optional
+    because the chart is, and a day whose picture failed to draw still has an email.
+    """
+    title = html.escape(name)
+    station = f"<code>{html.escape(station_id)}</code>" if station_id else "—"
+    footer = "Generated by the <code>temperature</code> Airflow DAG.<br>Source: Meteostat."
+
+    if series.empty:
+        return f"""<html><head><style>{STYLE}</style></head><body>
+  <h2>{title}</h2>
+  <div class="sub">No observations for the requested day.</div>
+  <p>Meteostat returned nothing for station {station}. That is expected where a
+     station has a gap in its record, and on any run that lands before the day's
+     first observation has been published.</p>
+  <p class="foot">{footer}</p>
+</body></html>"""
+
+    day = str(series.index[0])[:10]
+    high, low = series.max(), series.min()
+
+    chart = ""
+    if chart_cid:
+        chart = (
+            f'<img src="cid:{html.escape(chart_cid)}" width="723" alt="Hourly temperatures"\n'
+            '       style="max-width:100%;height:auto;margin-bottom:18px">'
+        )
+
+    detail = _rows(
+        [
+            ("Station", station),
+            ("Day", _fmt(day)),
+            ("High / low", f"{_degrees(high)} / {_degrees(low)}"),
+            ("Swing", _degrees(high - low)),
+            ("Mean", _degrees(series.mean())),
+            ("Latest", f"{_degrees(series.iloc[-1])} at {html.escape(str(series.index[-1])[11:16])}"),
+            ("Observations", _fmt(len(series))),
+        ]
+    )
+
+    return f"""<html><head><style>{STYLE}</style></head><body>
+  <h2>{title}</h2>
+  <div class="sub">Hourly observations for {html.escape(day)}.</div>
+  <p style="margin:0 0 20px">
+    <span style="font-size:30px;font-weight:600">{_degrees(high)}</span>
+    <span style="color:#666;font-size:16px;margin-left:10px">high, {_degrees(low)} low</span></p>
+  {chart}
+  <table>{detail}</table>
+  <p class="foot">{footer}</p>
+</body></html>"""
+
+
+# ---------------------------------------------------------------------- mime assembly
+
+
+def build_message(
+    *,
+    mail_from: str,
+    to: list[str],
+    subject: str,
+    html_content: str,
+    inline_images: dict[str, str] | None = None,
+    files: list[str] | None = None,
+) -> MIMEMultipart:
+    """A MIME tree that can carry both an inline image and ordinary attachments.
+
+    ``SmtpHook.send_email_smtp`` cannot do this: it attaches every file with
+    ``Content-Disposition: attachment`` and no ``Content-ID``, so nothing in the body
+    can point at one. The nesting below is what mail clients actually require —
+
+        multipart/mixed
+        ├── multipart/related     the body and the images it references
+        │   ├── text/html
+        │   └── image/png         Content-ID: <...>, disposition inline
+        └── application/json      a real attachment
+
+    — and getting it wrong shows up as the map appearing twice, once broken and once as
+    a download, rather than as an error.
+
+    ``inline_images`` maps Content-ID (no angle brackets) to a local file path.
+    """
+    message = MIMEMultipart("mixed")
+    message["Subject"] = subject
+    message["From"] = mail_from
+    message["To"] = ", ".join(to)
+    message["Date"] = formatdate(localtime=True)
+    message["Message-ID"] = make_msgid()
+
+    related = MIMEMultipart("related")
+    related.attach(MIMEText(html_content, "html", "utf-8"))
+
+    for cid, path in (inline_images or {}).items():
+        with open(path, "rb") as handle:
+            image = MIMEImage(handle.read())
+        # Angle brackets here and not in the cid: reference in the HTML — that
+        # asymmetry is the spec, and the commonest way this comes out broken.
+        image.add_header("Content-ID", f"<{cid}>")
+        image.add_header("Content-Disposition", "inline", filename=os.path.basename(path))
+        related.attach(image)
+
+    message.attach(related)
+
+    for path in files or []:
+        subtype = (mimetypes.guess_type(path)[0] or "application/octet-stream").split("/")[-1]
+        with open(path, "rb") as handle:
+            part = MIMEApplication(handle.read(), _subtype=subtype)
+        part.add_header("Content-Disposition", "attachment", filename=os.path.basename(path))
+        message.attach(part)
+
+    return message
+
+
+def recipients(value: str | list[str]) -> list[str]:
+    """Split the ``email_to`` config value the way the SMTP hook would.
+
+    It is a single string in ice_config today, but the hook has always accepted a
+    comma- or semicolon-separated list and so does this.
+    """
+    if isinstance(value, list):
+        return [address.strip() for address in value if address.strip()]
+    return [address.strip() for address in value.replace(";", ",").split(",") if address.strip()]
+
+
+def render_failure(context_summary: dict, error: str) -> str:
+    rows = _rows([(k, _fmt(v)) for k, v in context_summary.items()])
+    pre = "background:#fdf2f2;border-left:3px solid #d33;padding:10px;white-space:pre-wrap"
+    return f"""<html><head><style>{STYLE}</style></head><body>
+  <h2>GDAL inspection failed</h2>
+  <div class="sub">A raster landed in S3 but the pipeline could not report on it.</div>
+  <table>{rows}</table>
+  <h3 style="font-size:15px">Error</h3>
+  <pre style="{pre}">{html.escape(error)}</pre>
+  <p class="foot">Check the task logs in the Airflow UI for the full traceback.</p>
+</body></html>"""
+
+
+# ------------------------------------------------------------------------ dummy email
+
+
+def dummy_email(value: int, *, mail_from: str, to: list[str]) -> MIMEMultipart:
+    """A minimal message whose whole body is one integer.
+
+    A smoke test for the SMTP path: no S3, no raster, no attachments, so anything that
+    fails is the connection or the credentials rather than the pipeline. Returns the
+    message instead of sending it, like everything else here — the DAG opens the hook
+    and hands this to ``sendmail``.
+    """
+    number = _fmt(int(value))
+    return build_message(
+        mail_from=mail_from,
+        to=to,
+        subject=f"[test] {number}",
+        html_content=(
+            f"<html><head><style>{STYLE}</style></head><body>"
+            f"<h2>{number}</h2>"
+            '<div class="sub">Dummy email — nothing but a number.</div>'
+            "</body></html>"
+        ),
+    )

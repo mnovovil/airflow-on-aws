@@ -1,0 +1,196 @@
+name: deploy
+
+# Which branch you push decides which environment is built, and nothing else does.
+# main -> prod, dev -> dev. The mapping lives in one step below, and both the state
+# key and the variables come out of it together — the pair that must never be
+# mismatched is therefore never chosen twice.
+# Push triggers are disabled: the AWS stack was torn down on 2026-09-02 to stop the
+# spend, and a push to main or dev would apply it straight back. workflow_dispatch is
+# left in place, so a deliberate run from the Actions tab still rebuilds either
+# environment. Restore the two lines below to go back to deploy-on-push.
+on:
+  # push:
+  #   branches: [main, dev]
+  workflow_dispatch:
+
+# One deploy at a time PER ENVIRONMENT. Terraform's state lock is per state key, so
+# a dev apply and a prod apply genuinely do not conflict; serialising them here
+# would only make the dev branch wait on prod for no reason.
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # required to mint the OIDC token for AWS
+
+env:
+  AWS_REGION: eu-north-1
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The one place the branch-to-environment mapping is written down. An
+      # unmapped branch fails here rather than defaulting to prod, which matters
+      # because workflow_dispatch can be run against any ref.
+      - name: Select the environment
+        id: env
+        run: |
+          case "${{ github.ref_name }}" in
+            main) echo "name=prod" >> "$GITHUB_OUTPUT" ;;
+            dev)  echo "name=dev"  >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::No environment is mapped to '${{ github.ref_name }}'." \
+                   "Add one to envs/, backends/ and this step before deploying it."
+              exit 1
+              ;;
+          esac
+
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4
+
+      # Infrastructure first: the image build needs the ECR repository, and the
+      # DAG sync needs the artifacts bucket.
+      - name: terraform apply
+        working-directory: infra
+        env:
+          ENV: ${{ steps.env.outputs.name }}
+          # The fire DAG's FIRMS MAP_KEY. It has no value in the committed tfvars
+          # because it is a credential, and it defaults to "" — so without it here
+          # every deploy would quietly overwrite the deployed key with an empty
+          # string, and the next fire run would be the first thing to say so.
+          TF_VAR_fire_key: ${{ secrets.FIRE_KEY }}
+        run: |
+          # var.fire_key defaults to "" so that an apply which does not touch the fire
+          # DAG still works without it. Unattended, that default is a trap: a deploy
+          # missing the secret applies an empty map_key over a working one, reports
+          # success, and the first sign is a scheduled fire run failing hours later.
+          # GitHub substitutes a missing secret with an empty string and says nothing,
+          # so this is the only place it can be noticed.
+          if [ -z "$TF_VAR_fire_key" ]; then
+            echo "::error::FIRE_KEY is not set in this repository's Actions secrets."
+            echo "::error::Applying now would overwrite ice_config's fire.map_key with an empty string."
+            echo "::error::Set it with: gh secret set FIRE_KEY"
+            exit 1
+          fi
+          terraform init -input=false -backend-config="backends/$ENV.hcl"
+          terraform apply -auto-approve -input=false -var-file="envs/$ENV.tfvars"
+
+      - name: Read stack outputs
+        id: tf
+        working-directory: infra
+        run: |
+          {
+            echo "ecr_url=$(terraform output -raw ecr_repository_url)"
+            echo "artifacts_bucket=$(terraform output -raw artifacts_bucket)"
+            echo "source_bucket=$(terraform output -raw source_bucket)"
+            echo "image_secret=$(terraform output -raw gdal_image_secret_id)"
+            echo "airflow_ecr_url=$(terraform output -raw airflow_ecr_repository_url)"
+            echo "airflow_image_secret=$(terraform output -raw airflow_image_secret_id)"
+            echo "airflow_ui=$(terraform output -raw airflow_ui)"
+            echo "state_env=$(terraform output -raw env)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Cheap insurance against the one mistake this layout still allows: variables
+      # applied over another environment's state. The apply above would already have
+      # done the damage, but the image and the DAGs stop here rather than follow it.
+      - name: Confirm the state matches the branch
+        env:
+          ENV: ${{ steps.env.outputs.name }}
+          STATE_ENV: ${{ steps.tf.outputs.state_env }}
+        run: |
+          if [ "$STATE_ENV" != "$ENV" ]; then
+            echo "::error::Branch ${{ github.ref_name }} expects '$ENV' but the state says '$STATE_ENV'."
+            exit 1
+          fi
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Each environment has its own ECR repository, so the tags need no environment
+      # in them — the same commit produces ice/gdal-report:<sha> in prod and
+      # ice-dev/gdal-report:<sha> in dev, and the two share no cache.
+      - name: Build and push the GDAL image
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          tags: |
+            ${{ steps.tf.outputs.ecr_url }}:${{ github.sha }}
+            ${{ steps.tf.outputs.ecr_url }}:latest
+          # The GDAL base image is large and rarely changes; caching the layers in
+          # the registry turns a ~4 minute build into well under one.
+          cache-from: type=registry,ref=${{ steps.tf.outputs.ecr_url }}:buildcache
+          cache-to: type=registry,ref=${{ steps.tf.outputs.ecr_url }}:buildcache,mode=max
+
+      # Point the DAG at this exact build rather than :latest, so what ran is always
+      # identifiable and a rollback is just re-running an older workflow. The secret
+      # name comes from the stack because its prefix differs per environment.
+      - name: Pin the worker to this image
+        run: |
+          aws secretsmanager put-secret-value \
+            --secret-id "${{ steps.tf.outputs.image_secret }}" \
+            --secret-string "${{ steps.tf.outputs.ecr_url }}:${{ github.sha }}"
+
+      # The Airflow box's own image, built from docker/airflow. Small next to the
+      # GDAL one — a pip install on top of the published Airflow image — but built
+      # here rather than on the box, which is the point: the box is a t3.small, and
+      # an image it builds itself has no name anyone can roll back to.
+      - name: Build and push the Airflow image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/airflow
+          push: true
+          tags: |
+            ${{ steps.tf.outputs.airflow_ecr_url }}:${{ github.sha }}
+            ${{ steps.tf.outputs.airflow_ecr_url }}:latest
+          cache-from: type=registry,ref=${{ steps.tf.outputs.airflow_ecr_url }}:buildcache
+          cache-to: type=registry,ref=${{ steps.tf.outputs.airflow_ecr_url }}:buildcache,mode=max
+
+      # Before the DAG sync, not after. Both reach the box on their own one-minute
+      # timer, so the order here does not strictly control the order there — but a
+      # DAG that needs a new dependency is broken in the window between the two, and
+      # pointing at the image first makes that window the exception rather than the
+      # rule.
+      - name: Pin the Airflow box to this image
+        run: |
+          aws secretsmanager put-secret-value \
+            --secret-id "${{ steps.tf.outputs.airflow_image_secret }}" \
+            --secret-string "${{ steps.tf.outputs.airflow_ecr_url }}:${{ github.sha }}"
+
+      # The Airflow box pulls this prefix down on a one-minute timer, which is how
+      # a deploy reaches it without a second deployment mechanism.
+      - name: Sync DAGs
+        run: |
+          aws s3 sync dags/ "s3://${{ steps.tf.outputs.artifacts_bucket }}/dags/" \
+            --delete \
+            --exclude '__pycache__/*'
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed \`${{ steps.env.outputs.name }}\`"
+            echo ""
+            echo "- GDAL image: \`${{ steps.tf.outputs.ecr_url }}:${{ github.sha }}\`"
+            echo "- Airflow image: \`${{ steps.tf.outputs.airflow_ecr_url }}:${{ github.sha }}\`"
+            echo "- Upload a raster to: \`s3://${{ steps.tf.outputs.source_bucket }}/\`"
+            echo "- Airflow: ${{ steps.tf.outputs.airflow_ui }} (port-forward over SSM to reach it)"
+            echo ""
+            echo "DAG changes are picked up within a minute or two, and so is a new"
+            echo "Airflow image — both boxes poll. A change to"
+            echo "\`docker/airflow/requirements.txt\` ships as a new image; it no longer"
+            echo "needs the instance replaced, and no longer silently fails to arrive."
+          } >> "$GITHUB_STEP_SUMMARY"

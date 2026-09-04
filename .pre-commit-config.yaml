@@ -1,0 +1,38 @@
+# Installed with:
+#
+#     pip install pre-commit && pre-commit install
+#     pre-commit run --all-files    # sweep the tree once, not just the next commit
+#
+# The point of these four is that none of them depend on remembering. Everything in
+# this repository is a placeholder on purpose — 123456789012, example-dem,
+# sender@example.com — and the way that stops being true is one hurried commit with a
+# real value pasted in, in a repository that is public.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      # Catches the credential itself: AWS keys, tokens, connection strings. This is
+      # the one that would have to fail before a real FIRMS MAP_KEY or an SES SMTP
+      # password reached a commit.
+      - id: gitleaks
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: detect-private-key
+      # 1 MB. Rasters are gitignored by extension, but a .tif renamed to .dat is not,
+      # and a test raster is the most likely large file to arrive here by accident.
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      # Same version pr.yml pins, so a commit that passes here passes CI.
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format

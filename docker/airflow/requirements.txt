@@ -1,0 +1,46 @@
+# Installed into the Airflow image built from the Dockerfile beside this file.
+#
+# The constraint line must match the base image's Airflow and Python versions —
+# without it a provider bump can drag in an incompatible Airflow core, and the first
+# sign of that is a scheduler that will not start.
+#
+# Versions are deliberately left to the constraint file rather than pinned here:
+# pinning a version the constraints disagree with makes the pip install fail
+# outright, which now surfaces as a red image build rather than as a box that came
+# up without the package.
+--constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.3/constraints-3.11.txt"
+
+# Already in the base image; listed so the dependency is explicit and so a future
+# base-image change cannot quietly remove it. pandas is here for the same reason
+# rather than because anything is missing: it arrives with the airflow image's
+# default extras, which is exactly the kind of thing an image bump can drop.
+apache-airflow-providers-smtp
+apache-airflow-providers-amazon
+pandas
+
+# Not in the Airflow constraint file, so this one carries its own bound — contrary
+# to the rule above, which only applies to packages the constraints already cover.
+# yfinance changes its return shapes between minor versions (the MultiIndex columns
+# that get_stock_data flattens arrived in one such), so the major is held.
+yfinance>=0.2,<0.3
+
+# Also outside the constraint file (it lists matplotlib-inline, which is a different
+# package), so it carries its own bound too. create_chart in sgo.py renders the
+# session's hourly closes with it; the major is held because a 4.x would be free to
+# move the pyplot API it uses.
+matplotlib>=3.8,<4
+
+# Outside the constraint file too, and pulled in by the `fire` DAG: get_country_geometry
+# reads Natural Earth's country polygons with it, and create_chart draws the outline the
+# detections are mapped onto. The 1.x line is what has pyogrio as a hard dependency,
+# which is what makes the pushed-down `where=` filter available — 0.x would need fiona
+# installed separately for it.
+geopandas>=1.0,<2
+
+# Outside the constraint file as well, and the reason the 1.x line is held rather
+# than the current one: meteostat 2.x requires pandas>=2.3 and pytz<2024, while the
+# constraints above pin pandas==2.1.4 and pytz==2024.2. Those cannot both be true, so
+# a 2.x here does not produce a bad image — it produces a pip resolution error and a
+# red build. 1.7 has the API temperature.py uses (Hourly(station, start, end)); the
+# functional ms.hourly()/ms.Station of 2.x is a different library in the same name.
+meteostat>=1.7,<2

@@ -1,0 +1,143 @@
+# Airflow, as it runs on the EC2 box.
+#
+# Written to /opt/ice/docker-compose.yml verbatim by the bootstrap script, which
+# base64-decodes it rather than templating it — Terraform's templatefile() and
+# docker compose both claim ${...}, and interleaving the two escapes is how this file
+# would end up unreadable.
+#
+# Values come from /opt/ice/.env, which the bootstrap writes. Two levels of $ are in
+# play and they mean different things:
+#   ${VAR}   compose substitutes from .env when it parses this file
+#   $${VAR}  compose emits a literal ${VAR}, for bash inside the container to expand
+name: ice-airflow
+
+x-airflow-common: &airflow-common
+  # Pulled, not built. AIRFLOW_IMAGE comes from .env, where sync-image.sh writes
+  # whichever tag the pointer secret names; there is deliberately no build: stanza to
+  # fall back to, so an unreachable registry stops the box rather than starting an
+  # Airflow without the DAGs' dependencies in it.
+  image: ${AIRFLOW_IMAGE}
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${POSTGRES_PASSWORD}@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+
+    # Sized for 2 GiB. The web server defaults to four gunicorn workers and the
+    # scheduler to two parsing processes, which together are most of what pushed
+    # this box into swap and then into not answering at all. One DAG does not need
+    # four workers, and the REST API the trigger Lambda calls is served by them, so
+    # the web server has to stay up rather than be removed.
+    AIRFLOW__WEBSERVER__WORKERS: "2"
+    AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+
+    # Airflow pauses newly discovered DAGs by default, and a paused DAG accepts a
+    # triggered run and then never executes it. For an event-driven pipeline that is
+    # indistinguishable from the upload vanishing. Safe to disable here because
+    # gdalinfo_notify has schedule=None: unpaused still means nothing runs until
+    # something triggers it.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+
+    # Variables and Connections resolve from Secrets Manager, which is how the SMTP
+    # credentials and the DAG's config get in without touching the Airflow UI.
+    #
+    # SECRETS_PREFIX comes from .env and is what separates the environments: it is
+    # "airflow" on the prod box and "airflow-dev" on the dev one, so the same DAG
+    # asking for the same variable name resolves to a different secret on each. It
+    # is substituted by compose here rather than templated by Terraform, like every
+    # other value in this file.
+    AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS: "False"
+    AIRFLOW__SECRETS__BACKEND: airflow.providers.amazon.aws.secrets.secrets_manager.SecretsManagerBackend
+    AIRFLOW__SECRETS__BACKEND_KWARGS: '{"connections_prefix": "${SECRETS_PREFIX}/connections", "variables_prefix": "${SECRETS_PREFIX}/variables"}'
+
+    # basic_auth is what lets the trigger Lambda POST a DAG run with nothing but a
+    # username and password, and no request signing.
+    # The session backend stays alongside it so the web UI still logs in.
+    AIRFLOW__API__AUTH_BACKENDS: airflow.providers.fab.auth_manager.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+
+    # Credentials come from the instance profile via IMDS; only the region is set.
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+    AWS_REGION: ${AWS_REGION}
+  volumes:
+    # Read-only: the sync timer owns this directory, and a task writing into it
+    # would be silently reverted within the minute.
+    - /opt/ice/dags:/opt/airflow/dags:ro
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Migrates the database and creates the UI login, then exits. The credentials reach
+  # bash as environment and are expanded inside the container, so the password is not
+  # baked into the command string — it is still in the container's environment, which
+  # is unavoidable, but it does not show up in `ps` output on the box.
+  airflow-init:
+    <<: *airflow-common
+    # `bash` as the first argument rather than an `entrypoint:` override — the image's
+    # entrypoint is what Airflow's CLI depends on to resolve its own UID to a
+    # username, and it refuses to run without one.
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --username "$${AIRFLOW_ADMIN_USER}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname ice --lastname airflow --role Admin \
+          --email admin@example.invalid || true
+    environment:
+      <<: *airflow-common-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    # Bound on every interface, but the security group decides who may connect —
+    # by default only the trigger Lambda's group.
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db:
+  airflow-logs:

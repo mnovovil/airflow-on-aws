@@ -1,0 +1,20 @@
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = [".venv", "infra/.build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    # Airflow task callables take **context and legitimately ignore it.
+    "B008",
+]
+
+[tool.ruff.lint.isort]
+# Airflow puts dags/ on sys.path, so these are first-party imports even though they
+# are not an installed package. Without this they sort in with third-party ones.
+known-first-party = ["common", "gdalinfo_notify", "publish", "conftest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

@@ -1,0 +1,212 @@
+name: pr
+
+# Runs for PRs into either deployable branch. The plan below is of the environment
+# the PR would actually land in — a change merged into dev is planned against dev's
+# state, and the same change opened against main is planned against prod's.
+on:
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+env:
+  AWS_REGION: eu-north-1
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  python:
+    name: lint and DAG import
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the Python the Airflow box runs 2.10.3 on. Linting against a
+          # different minor version misses syntax the environment would reject.
+          python-version: "3.11"
+
+      - name: Lint
+        run: |
+          pip install ruff==0.6.9
+          ruff check app dags lambda tests
+          ruff format --check app dags lambda tests
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The image the box will actually run, built from the same commit. Everything
+      # below tests against it rather than against a pip install that approximates
+      # it — which is the difference that matters here: the previous arrangement
+      # installed Airflow and its providers from the constraint file and let pandas
+      # and yfinance float, so CI could be green on versions no box would ever have.
+      - name: Build the Airflow image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/airflow
+          push: false
+          load: true
+          tags: ice-airflow:pr
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Catches the failure mode that is otherwise invisible until it has already
+      # been deployed: a DAG file that raises on import just silently stops appearing
+      # in the UI. Running it inside the image means a missing dependency fails here
+      # rather than on the box — which is exactly what this job missed when the stock
+      # DAG shipped importing yfinance.
+      #
+      # pytest and pystac are installed at run time rather than baked in: they are
+      # test-only, and putting them in the image would ship them to production. The
+      # cache provider is off because the working directory is a bind mount owned by
+      # the runner, not by the image's airflow user.
+      - name: DAG import check
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src --entrypoint bash ice-airflow:pr -c '
+            set -e
+            pip install --quiet --no-cache-dir pytest "pystac[validation]"
+            pytest tests -v -p no:cacheprovider
+          '
+
+  terraform:
+    name: terraform
+    runs-on: ubuntu-latest
+    # Only for PRs raised from a branch in this repository. A fork's PR gets no
+    # OIDC token and no secrets, so every step below would fail on credentials
+    # rather than on the change — a red check that tells a first-time contributor
+    # nothing except that they cannot fix it. Skipping is the honest report.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same mapping as deploy.yml, keyed on the branch being merged INTO.
+      - name: Select the environment
+        id: env
+        run: |
+          case "${{ github.base_ref }}" in
+            main) echo "name=prod" >> "$GITHUB_OUTPUT" ;;
+            dev)  echo "name=dev"  >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::No environment is mapped to '${{ github.base_ref }}'."
+              exit 1
+              ;;
+          esac
+
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4
+
+      - name: Format
+        run: terraform fmt -check -recursive
+
+      - name: Validate and plan
+        id: plan
+        working-directory: infra
+        env:
+          ENV: ${{ steps.env.outputs.name }}
+          # Same value the apply gets, so the plan is of the change being reviewed.
+          # Without it the variable falls back to "" and every plan reports ice_config
+          # as changing — a diff on a sensitive value, on every PR, that is only the
+          # secret this job was not given.
+          TF_VAR_fire_key: ${{ secrets.FIRE_KEY }}
+        run: |
+          # A warning rather than the apply's hard failure: a plan without the secret
+          # is still worth reading, it just reports ice_config as changing when the
+          # only thing changing is the value this job was not given. Saying so beats a
+          # reviewer approving a diff that is an artifact of CI's own configuration.
+          if [ -z "$TF_VAR_fire_key" ]; then
+            echo "::warning::FIRE_KEY is not set; any ice_config diff below is this job's missing secret, not the change under review."
+          fi
+          # Without this the step's status is tee's, not terraform's, and a plan
+          # that died reports a green check.
+          set -o pipefail
+          terraform init -input=false -backend-config="backends/$ENV.hcl"
+          terraform validate
+          # No lock: this plan only reads state and its plan file is thrown away,
+          # while merging the PR starts an apply on the very same state key. Taking
+          # the lock only buys a race that fails on timing rather than on the diff.
+          # stderr is folded into the output so a plan that does fail explains
+          # itself in the comment instead of posting the wrapper's bare exit line.
+          status=0
+          terraform plan -input=false -no-color -lock=false -out=tfplan \
+            -var-file="envs/$ENV.tfvars" 2>&1 | tee plan.txt || status=$?
+          # Only the counts leave this step. The plan body names the account, the
+          # buckets, the ARNs and the instance ids of a live stack, and this
+          # repository is public — a PR comment is the one place that text would
+          # be readable by anyone. The full plan stays in the workflow log, which
+          # is also public but is at least not addressed to a reader, and the
+          # reviewer who needs it is a collaborator who can open it.
+          #
+          # `terraform plan` prints its tally as "Plan: N to add, ..." and prints
+          # "No changes." instead when there are none, so one of the two matches
+          # unless the run failed before planning.
+          summary="$(grep -m1 -E '^(Plan:|No changes\.|Error:)' plan.txt || true)"
+          {
+            echo 'summary<<PLAN_EOF'
+            echo "${summary:-Plan did not complete. See the workflow log.}"
+            echo 'PLAN_EOF'
+          } >> "$GITHUB_OUTPUT"
+          # Fails the check, but only after the output above is set, so the comment
+          # step still has something to post.
+          exit $status
+
+      - name: Comment the plan
+        # A failed plan is exactly the one a reviewer needs to read, so this runs
+        # on failure too. The empty check keeps it quiet when the step above died
+        # before a plan existed at all, in init or validate.
+        if: ${{ !cancelled() && steps.plan.outputs.summary != '' }}
+        uses: actions/github-script@v7
+        env:
+          # Read through the environment rather than substituted into the script,
+          # so a plan or an error containing a backtick cannot end the template
+          # literal it is being pasted into.
+          TF_ENV: ${{ steps.env.outputs.name }}
+          TF_PLAN: ${{ steps.plan.outputs.summary }}
+          TF_OUTCOME: ${{ steps.plan.outcome }}
+          TF_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            // The environment is in the heading because the same diff plans
+            // differently against each one, and reviewing prod's plan believing it
+            // is dev's is the mistake worth making impossible. The outcome is there
+            // because a failed plan has no counts to show, and a reader skimming
+            // for the tally should not have to work that out for themselves.
+            const { TF_ENV, TF_PLAN, TF_OUTCOME, TF_RUN_URL } = process.env;
+            const status = TF_OUTCOME === 'success' ? '' : ' — **failed**';
+            const body = `#### Terraform plan — \`${TF_ENV}\`${status}\n\n\`\`\`\n${TF_PLAN}\n\`\`\`\n\n[Full plan in the workflow log](${TF_RUN_URL}).`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.startsWith('#### Terraform plan'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body,
+              });
+            }
+
+  docker:
+    name: build image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only — no push and no AWS credentials needed. Just proves the
+      # Dockerfile is still valid before it reaches a deployable branch.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: false
