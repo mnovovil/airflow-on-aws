@@ -61,9 +61,6 @@ resource "aws_secretsmanager_secret_version" "ice_config" {
     source_bucket    = local.source_bucket_id
     report_prefix    = "reports"
     email_to         = var.email_to
-    filepath_txt     = "/tmp/trigger.txt"
-    LOW              = 1
-    HIGH             = 100
     # The stocks the `stock` DAG reports on, one email per entry and in this order. A
     # trigger-with-config run can name a single different one for that run; this is
     # what every scheduled run uses, and the DAG falls back to its own constant if

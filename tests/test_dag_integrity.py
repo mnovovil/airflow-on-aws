@@ -30,8 +30,6 @@ def test_no_import_errors(dagbag):
         "gdalinfo_notify",
         "stac_publish",
         "gdal_weather",
-        "random_email",
-        "random_numbers",
         "stock",
         "temperature",
     ],

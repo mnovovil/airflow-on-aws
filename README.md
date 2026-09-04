@@ -1,11 +1,17 @@
 # ice
 
 An **Apache Airflow** deployment on AWS, built end to end with Terraform and deployed
-by GitHub Actions. It runs eight DAGs: one reacts to files landing in S3, the rest are
+by GitHub Actions. It runs six DAGs: one reacts to files landing in S3, the rest are
 scheduled reports that arrive by email.
 
 The idea in one line: **a raster lands in an S3 bucket, a container inspects it, and you
 get an email about it.**
+
+> **A personal repository.** This is my own collection of things I like to have
+> automated and running for personal use — the reports I want in my inbox, built the
+> way I want to build them. It is public so it can be read and reused, but it is not a
+> product and it is not maintained for anyone else: there is no support, no roadmap,
+> and no promise that it stays the way you found it.
 
 > **Status — not currently deployed.** The AWS environments were destroyed to stop the
 > monthly spend, and `deploy.yml` only runs on `workflow_dispatch` so a push cannot
@@ -86,8 +92,6 @@ network path into the VPC.
 | `temperature` | daily, 08:00 ET | Tomorrow's forecast for the configured weather stations, one email per station. |
 | `stock` | weekdays, 13:00 ET | The session's closing price and an intraday chart, one email per ticker. |
 | `stac_publish` | daily | Rebuilds `collection.json` over every STAC item in the bucket. |
-| `random_email` | daily | Smoke test — draws a number, emails it. Proves the SMTP path still works. |
-| `random_numbers` | manual | Same idea, but one dynamically mapped task per number you pass at trigger time. |
 
 Only the first two use the GDAL worker. The rest run entirely on the Airflow box.
 
@@ -118,29 +122,10 @@ flowchart TB
         direction LR
         f1[backfill_items] --> f2[write_collection]
     end
-
-    subgraph G["<b>random_email</b> — daily smoke test"]
-        direction LR
-        g1[draw_num] --> g2[write_txt] --> g3{{check_num}}
-        g3 -->|"even"| g4[even_num]
-        g3 -->|"odd"| g5[odd_num]
-        g4 --> g6[delete_txt]
-        g5 --> g6
-    end
-
-    subgraph H["<b>random_numbers</b> — manual · one mapped task per number"]
-        direction LR
-        h1[get_nums] --> h2["get_num [ ]"] --> h3["write_txt [ ]"] --> h4{{"check_num [ ]"}}
-        h4 -->|"even"| h5["even_num [ ]"]
-        h4 -->|"odd"| h6["odd_num [ ]"]
-        h5 --> h7["delete_txt [ ]"]
-        h6 --> h7
-    end
 ```
 
-`{{ }}` marks a **branch** — exactly one of its downstream tasks runs and the other is
-marked skipped. `[ ]` marks a **dynamically mapped** task: one copy per input, decided at
-run time.
+`{{ }}` marks a **branch** — exactly one of its downstream tasks runs and the others are
+marked skipped.
 
 ### `gdalinfo_notify` in detail
 
@@ -206,7 +191,7 @@ stacks pointed at one bucket would take turns deleting each other's triggers —
 
 | Path | What |
 |---|---|
-| `dags/` | The eight DAGs, plus helpers for EC2/SSM, NOMADS, email rendering and STAC |
+| `dags/` | The six DAGs, plus helpers for EC2/SSM, NOMADS, email rendering and STAC |
 | `app/` | The GDAL container — `gdal_report.py` inspects a raster, `gfs_rain.py` maps a forecast |
 | `docker/airflow/` | The Airflow image the box runs |
 | `lambda/trigger_dag/` | S3 event → Airflow, dependency-free |
@@ -214,7 +199,7 @@ stacks pointed at one bucket would take turns deleting each other's triggers —
 | `infra/envs/`, `infra/backends/` | The per-environment variables and state keys |
 | `infra/bootstrap/` | State bucket, GitHub OIDC provider, deploy role — run once by hand |
 | `scripts/` | Helper scripts — `bootstrap.sh`, `smoke_test.sh`, `airflow_ui.sh`, `stac_ui.sh`, `shell.sh`, `put_file.sh` |
-| `tests/` | 390 tests — DAG import and structure, the Lambda, email rendering, SSM commands, and guards against the two environments drifting into each other |
+| `tests/` | 326 tests — DAG import and structure, the Lambda, email rendering, SSM commands, and guards against the two environments drifting into each other |
 | `docs/reference.md` | The long version: design rationale, operating notes, cost, teardown and rebuild |
 
 ---
@@ -262,7 +247,7 @@ Full walkthrough, including what to do when a step fails:
 
 ```bash
 cp local/.env.example local/.env   # then edit it — the copy is gitignored
-python -m pytest tests             # 390 tests, no AWS needed
+python -m pytest tests             # 326 tests, no AWS needed
 ruff check app dags lambda tests
 ```
 
