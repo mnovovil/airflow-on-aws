@@ -13,11 +13,6 @@ get an email about it.**
 > product and it is not maintained for anyone else: there is no support, no roadmap,
 > and no promise that it stays the way you found it.
 
-> **Status — not currently deployed.** The AWS environments were destroyed to stop the
-> monthly spend, and `deploy.yml` only runs on `workflow_dispatch` so a push cannot
-> rebuild them. The code is unchanged and accurate. See
-> [docs/reference.md](docs/reference.md#rebuilding) before applying it again.
-
 > **Placeholders.** Account IDs, bucket names and email addresses in this repository are
 > examples (`123456789012`, `example-dem`, `sender@example.com`). Replace them in
 > `infra/envs/*.tfvars`, `infra/versions.tf` and `infra/bootstrap/variables.tf` before
